@@ -138,6 +138,10 @@ class ParserException(BaseException):
   pass
 
 class BeanstalkParser(object):
+
+  def __init__(self, client):
+    self.client = client
+
   def put(self, connection):
     pass
 
@@ -147,7 +151,7 @@ class BeanstalkParser(object):
 
     try:
       body = connection.read(int(nb_bytes))
-      return Job(job_id, body, self)
+      return Job(job_id, body, self.client)
     except:
       raise ParserException("An exception occured when reading job body")
 
@@ -155,16 +159,18 @@ class BeanstalkParser(object):
     line = connection.read().rstrip()
 
     try:
-      action, job_id, nb_bytes = line.split(" ")
+      if line.find(" ") == -1:
+        if line == "TIMED_OUT":
+          return None
 
-      if action == "RESERVED":
-        return self._reserve_with_body(connection, job_id, nb_bytes)
+        if line == "DEADLINE_SOON":
+          return None
+      else:
+        action, job_id, nb_bytes = line.split(" ")
 
-      if action == "TIMED_OUT":
-        return None
+        if action == "RESERVED":
+          return self._reserve_with_body(connection, job_id, nb_bytes)
 
-      if action == "DEADLINE_SOON":
-        return None
     except BaseException as exp:
       if isinstance(exp, ParserException):
         raise exp
@@ -190,11 +196,25 @@ class BeanstalkParser(object):
 
   def watch(self, connection):
     line = connection.read().rstrip()
-    print line
+    assert line.startswith("WATCHING")
+    return True
+
+  def use(self, connection):
+    line = connection.read().rstrip()
+    assert line.startswith("USING")
+    return True
+
+  def delete(self, connection):
+    line = connection.read().rstrip()
+    return True
+
+  def bury(self, connection):
+    line = connection.read().rstrip()
+    return True
 
   def ignore(self, connection):
     line = connection.read().rstrip()
-    print line
+    return True
 
 class ConnectionPool(object):
   def __init__(self, connection_class=Connection, max_connections=None, **connection_kwargs):
@@ -248,6 +268,9 @@ class Job(object):
   def delete(self):
     self.beanstalk.delete(self.jid)
 
+  def bury(self):
+    self.beanstalk.bury(self.jid)
+
   def burry(self):
     self.beanstalk.delete(self.jid)
 
@@ -258,15 +281,15 @@ class Beanstalk(object):
   def __init__(self, host="localhost", port=11300, connection_pool=None,
                parse_class=BeanstalkParser):
 
-    if not pool:
+    if not connection_pool:
       self.pool = ConnectionPool(host, port)
     else:
-      self.pool = pool
+      self.pool = connection_pool
 
     self.use_tube = None
     self.watch_tubes = []
 
-    self.parser = BeanstalkParser()
+    self.parser = BeanstalkParser(self)
 
   def _send_command(self, connection, command, parser_method):
     try:
@@ -331,13 +354,5 @@ class Beanstalk(object):
     return self._make_request("delete %s\r\n" % job_id, self.parser.delete)
 
   def bury(self, job_id, priority=DEFAULT_PRIORITY):
-    return self._make_request("bury %s\r\n" % job_id, self.parser.bury)
+    return self._make_request("bury %s %s\r\n" % (job_id, priority), self.parser.bury)
 
-if __name__ == "__main__":
-  pool = ConnectionPool(host="127.0.0.1", port=11300)
-  client = Beanstalk(connection_pool=pool)
-
-  client.watch("facebook_crawl")
-  job = client.reserve()
-  #job.delete()
-  #print client.put("mama are mere")
