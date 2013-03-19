@@ -20,6 +20,15 @@ DEFAULT_TTR = 120
 class BeanstalkError(BaseException):
   pass
 
+class ResponseError(BeanstalkError):
+  pass
+
+class InvalidResponse(BeanstalkError):
+  pass
+
+class InternalError(BeanstalkError):
+  pass
+
 class ConnectionError(BeanstalkError):
   pass
 
@@ -163,7 +172,21 @@ class BeanstalkParser(object):
         raise ParserException("Expected [RESERVED <id> <bytes>] or [TIMED_OUT] or [DEADLINE_SOON] but got %s" % line)
   def put(self, connection):
     line = connection.read().rstrip()
-    print line
+
+    if line.find(" ") != -1:
+      action, job_id = line.split(" ")
+
+      if action == "INSERTED":
+        return job_id
+      elif action == "BURIED":
+        raise BeanstalkError("Server run out of memory")
+    else:
+      if line == "EXPECTED_CRLF":
+        raise InternalError("The put jobs need to be followed by CRLF")
+      elif line == "DRAINING":
+        raise ResponseError("The server is shutting down")
+      elif line == "JOB_TOO_BIG":
+        raise ResponseError("The job body needs to be lower than 2**16")
 
   def watch(self, connection):
     line = connection.read().rstrip()
@@ -223,10 +246,10 @@ class Job(object):
     self.beanstalk = beanstalk
 
   def delete(self):
-    pass
+    self.beanstalk.delete(self.jid)
 
   def burry(self):
-    pass
+    self.beanstalk.delete(self.jid)
 
   def __repr__(self):
     return "jid: %s, body=%s" % (self.jid, self.body)
@@ -262,7 +285,6 @@ class Beanstalk(object):
 
     for tube in self.watch_tubes:
       self._send_command(connection, "watch %s\r\n" % tube, self.parser.watch)
-
     self._send_command(connection, "ignore default\r\n", self.parser.ignore)
 
     del connection.just_created
@@ -305,12 +327,17 @@ class Beanstalk(object):
   def ignore(self, name):
     return self._make_request("ignore %s\r\n" % name, self.parser.ignore)
 
+  def delete(self, job_id):
+    return self._make_request("delete %s\r\n" % job_id, self.parser.delete)
+
+  def bury(self, job_id, priority=DEFAULT_PRIORITY):
+    return self._make_request("bury %s\r\n" % job_id, self.parser.bury)
+
 if __name__ == "__main__":
   pool = ConnectionPool(host="127.0.0.1", port=11300)
   client = Beanstalk(connection_pool=pool)
 
   client.watch("facebook_crawl")
   job = client.reserve()
-  print job
-
-  #client.put("mama are mere")
+  #job.delete()
+  #print client.put("mama are mere")
