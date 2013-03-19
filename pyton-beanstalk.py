@@ -14,6 +14,8 @@ Key features:
 """
 
 MAX_READ_LENGTH = 1000000
+DEFAULT_PRIORITY = 2 ** 31
+DEFAULT_TTR = 120
 
 class BeanstalkError(BaseException):
   pass
@@ -64,7 +66,7 @@ class Connection(object):
     except socket.error:
       pass
     self._sock = None
-  
+
   def _connect(self):
     """
     Create a TCP socket connection
@@ -74,7 +76,7 @@ class Connection(object):
     sock.connect((self.host, self.port))
 
     return sock
-  
+
   def send_command(self, command):
     "Send an already packed command to the Redis server"
     if not self._sock:
@@ -95,14 +97,13 @@ class Connection(object):
       self.disconnect()
       raise
 
-
   def _readline(self):
     response = self._fp.readline()
     if not response:
       raise ConnectionError("Socket closed on remote end")
 
     return response
-  
+
   def read(self, length=None):
     if length == None:
       return self._readline()
@@ -131,24 +132,38 @@ class BeanstalkParser(object):
   def put(self, connection):
     pass
 
+  def _reserve_with_body(self, connection, job_id, nb_bytes):
+    assert job_id.isdigit()
+    assert nb_bytes.isdigit()
+
+    try:
+      body = connection.read(int(nb_bytes))
+      return Job(job_id, body, self)
+    except:
+      raise ParserException("An exception occured when reading job body")
+
   def reserve(self, connection):
     line = connection.read().rstrip()
 
     try:
       action, job_id, nb_bytes = line.split(" ")
 
-      assert action == "RESERVED"
-      assert job_id.isdigit()
-      assert nb_bytes.isdigit()
-    except:
-      raise ParserException("Expected RESERVED <id> <bytes> got %s" % line)
+      if action == "RESERVED":
+        return self._reserve_with_body(connection, job_id, nb_bytes)
 
-    try:
-      body = connection.read(int(nb_bytes))
+      if action == "TIMED_OUT":
+        return None
 
-      return Job(job_id, body, self)
-    except:
-      raise ParserException("An exception occured when reading job body")
+      if action == "DEADLINE_SOON":
+        return None
+    except BaseException as exp:
+      if isinstance(exp, ParserException):
+        raise exp
+      else:
+        raise ParserException("Expected [RESERVED <id> <bytes>] or [TIMED_OUT] or [DEADLINE_SOON] but got %s" % line)
+  def put(self, connection):
+    line = connection.read().rstrip()
+    print line
 
   def watch(self, connection):
     line = connection.read().rstrip()
@@ -166,7 +181,7 @@ class ConnectionPool(object):
     self._created_connections = 0
     self._available_connections = []
     self._in_use_connections = set()
-  
+
   def get_connection(self):
     "Get a connection from the pool"
     try:
@@ -262,7 +277,6 @@ class Beanstalk(object):
     finally:
       self.pool.release(connection)
 
-    
   def reserve(self, timeout=None):
 
     if timeout is not None:
@@ -271,13 +285,18 @@ class Beanstalk(object):
       command = 'reserve\r\n'
 
     return self._make_request(command, self.parser.reserve)
-  
+
   def use(self, name):
     self.use_tube = name
     return self._make_request("use %s\r\n" % name, self.parser.use)
-  
-  def put(self, item):
-    return self._make_request("use %s\r\n" % name, self.parser.put)
+
+  def put(self, body, priority=DEFAULT_PRIORITY, delay=0, ttr=DEFAULT_TTR):
+    if not isinstance(body, str):
+      raise BeanstalkError("Job body must be a str instance")
+
+    return self._make_request("put %s %s %s %s\r\n%s\r\n" %
+                              (priority, delay, ttr, len(body), body),
+                              self.parser.put)
 
   def watch(self, name):
     self.watch_tubes.append(name)
@@ -292,5 +311,6 @@ if __name__ == "__main__":
 
   client.watch("facebook_crawl")
   job = client.reserve()
-
   print job
+
+  #client.put("mama are mere")
