@@ -11,8 +11,6 @@ Key features:
   * connection pool
   * simple and clear implementation
 
-Each connection is tighly coupled to a tube.
-You cannot change this.
 """
 
 MAX_READ_LENGTH = 1000000
@@ -145,8 +143,12 @@ class BeanstalkParser(object):
     except:
       raise ParserException("Expected RESERVED <id> <bytes> got %s" % line)
 
-    line = connection.read(int(nb_bytes))
-    print line
+    try:
+      body = connection.read(int(nb_bytes))
+
+      return Job(job_id, body, self)
+    except:
+      raise ParserException("An exception occured when reading job body")
 
   def watch(self, connection):
     line = connection.read().rstrip()
@@ -180,23 +182,30 @@ class ConnectionPool(object):
       raise ConnectionError("Too many connections")
     self._created_connections += 1
 
-    return self.connection_class(**self.connection_kwargs)
+    new_connection = self.connection_class(**self.connection_kwargs)
+    new_connection.just_created = True
+    return new_connection
 
   def release(self, connection):
-    "Releases the connection back to the pool"
+    """
+    Releases the connection back to the pool
+    """
     self._in_use_connections.remove(connection)
     self._available_connections.append(connection)
 
   def disconnect(self):
-    "Disconnects all connections in the pool"
+    """
+    Disconnects all connections in the pool
+    """
     all_conns = chain(self._available_connections, self._in_use_connections)
     for connection in all_conns:
       connection.disconnect()
 
 class Job(object):
-  def __init__(self, jid, beanstalk):
-    self.beanstalk = beanstalk
+  def __init__(self, jid, body, beanstalk):
     self.jid = jid
+    self.body = body
+    self.beanstalk = beanstalk
 
   def delete(self):
     pass
@@ -204,21 +213,24 @@ class Job(object):
   def burry(self):
     pass
 
+  def __repr__(self):
+    return "jid: %s, body=%s" % (self.jid, self.body)
+
 class Beanstalk(object):
   def __init__(self, host="localhost", port=11300, connection_pool=None,
-               tube="", parse_class=BeanstalkParser):
+               parse_class=BeanstalkParser):
 
     if not pool:
       self.pool = ConnectionPool(host, port)
     else:
       self.pool = pool
 
+    self.use_tube = None
+    self.watch_tubes = []
+
     self.parser = BeanstalkParser()
 
-  def _make_request(self, command, parser_method):
-    pool = self.pool
-    connection = pool.get_connection()
-
+  def _send_command(self, connection, command, parser_method):
     try:
       connection.send_command(command)
       # read response and parsing it accordingly
@@ -228,9 +240,29 @@ class Beanstalk(object):
       connection.send_command(command)
       # read response and parsing it accordingly
       return parser_method(connection)
-    finally:
-      pool.release(connection)
 
+  def _set_tubes(self, connection):
+    if self.use_tube != None:
+      self._send_command(connection, "use %s\r\n" % self.use_tube, self.parser.use)
+
+    for tube in self.watch_tubes:
+      self._send_command(connection, "watch %s\r\n" % tube, self.parser.watch)
+
+    self._send_command(connection, "ignore default\r\n", self.parser.ignore)
+
+    del connection.just_created
+
+  def _make_request(self, command, parser_method):
+    connection = self.pool.get_connection()
+
+    try:
+      if hasattr(connection, "just_created"):
+        self._set_tubes(connection)
+      return self._send_command(connection, command, parser_method)
+    finally:
+      self.pool.release(connection)
+
+    
   def reserve(self, timeout=None):
 
     if timeout is not None:
@@ -241,12 +273,14 @@ class Beanstalk(object):
     return self._make_request(command, self.parser.reserve)
   
   def use(self, name):
+    self.use_tube = name
     return self._make_request("use %s\r\n" % name, self.parser.use)
   
   def put(self, item):
     return self._make_request("use %s\r\n" % name, self.parser.put)
 
   def watch(self, name):
+    self.watch_tubes.append(name)
     return self._make_request("watch %s\r\n" % name, self.parser.watch)
 
   def ignore(self, name):
@@ -254,7 +288,9 @@ class Beanstalk(object):
 
 if __name__ == "__main__":
   pool = ConnectionPool(host="127.0.0.1", port=11300)
-  client = Beanstalk(connection_pool=pool, tube="facebook_crawl")
+  client = Beanstalk(connection_pool=pool)
 
   client.watch("facebook_crawl")
-  client.reserve()
+  job = client.reserve()
+
+  print job
