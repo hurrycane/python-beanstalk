@@ -3,6 +3,10 @@ import socket
 import sys
 
 from itertools import chain
+from itertools import count
+
+from Queue import Queue
+from random import randint
 
 """
 Native Python Beanstalk client
@@ -10,12 +14,12 @@ Native Python Beanstalk client
 Key features:
   * connection pool
   * simple and clear implementation
-
+  * detailed error handling
 """
 
 MAX_READ_LENGTH = 1000000
 DEFAULT_PRIORITY = 2 ** 31
-DEFAULT_TTR = 120
+DEFAULT_TTR = 600
 
 class BeanstalkError(BaseException):
   pass
@@ -37,7 +41,6 @@ class Connection(object):
     self.host = host
     self.port = port
     self.socket_timeout = socket_timeout
-
     self._sock = None
 
   def connect(self):
@@ -142,16 +145,13 @@ class BeanstalkParser(object):
   def __init__(self, client):
     self.client = client
 
-  def put(self, connection):
-    pass
-
   def _reserve_with_body(self, connection, job_id, nb_bytes):
     assert job_id.isdigit()
     assert nb_bytes.isdigit()
 
     try:
       body = connection.read(int(nb_bytes))
-      return Job(job_id, body, self.client)
+      return Job(job_id, body, self.client, connection)
     except:
       raise ParserException("An exception occured when reading job body")
 
@@ -176,6 +176,26 @@ class BeanstalkParser(object):
         raise exp
       else:
         raise ParserException("Expected [RESERVED <id> <bytes>] or [TIMED_OUT] or [DEADLINE_SOON] but got %s" % line)
+
+  def peek(self, connection):
+    line = connection.read().rstrip()
+
+    try:
+      if line.find(" ") != -1:
+        if line == "NOT_FOUND":
+          return None
+      else:
+        action, job_id, nb_bytes = line.split(" ")
+
+        if action == "FOUND":
+          return self._reserve_with_body(connection, job_id, nb_bytes)
+
+    except BaseException as exp:
+      if isinstance(exp, ParserException):
+        raise exp
+      else:
+        raise ParserException("Expected [RESERVED <id> <bytes>] or [TIMED_OUT] or [DEADLINE_SOON] but got %s" % line)
+
   def put(self, connection):
     line = connection.read().rstrip()
 
@@ -199,6 +219,9 @@ class BeanstalkParser(object):
     assert line.startswith("WATCHING")
     return True
 
+  def touch(self, connection):
+    line = connection.read().rstrip()
+
   def use(self, connection):
     line = connection.read().rstrip()
     assert line.startswith("USING")
@@ -206,10 +229,18 @@ class BeanstalkParser(object):
 
   def delete(self, connection):
     line = connection.read().rstrip()
+
+    if line == "NOT_FOUND":
+      raise InvalidResponse("You tried to delete an item that is not present")
+
     return True
 
   def bury(self, connection):
     line = connection.read().rstrip()
+
+    if line == "NOT_FOUND":
+      raise InvalidResponse("You tried to bury an item that is not present")
+
     return True
 
   def ignore(self, connection):
@@ -217,39 +248,57 @@ class BeanstalkParser(object):
     return True
 
 class ConnectionPool(object):
-  def __init__(self, connection_class=Connection, max_connections=None, **connection_kwargs):
+  def __init__(self, connection_class=Connection, max_connections=20, **connection_kwargs):
     self.connection_class = connection_class
     self.connection_kwargs = connection_kwargs
-    self.max_connections = max_connections or 2 ** 31
-    self._created_connections = 0
-    self._available_connections = []
-    self._in_use_connections = set()
 
-  def get_connection(self):
-    "Get a connection from the pool"
-    try:
-      connection = self._available_connections.pop()
-    except IndexError:
-      connection = self.make_connection()
-    self._in_use_connections.add(connection)
-    return connection
+    self.max_connections = max_connections
+
+    # atomic integer counter
+    self._created_counter = count(0,1)
+    # atomic integer
+    self._created_connections = self._created_counter.next()
+
+    self._all_connections = {}
+
+    for i in range(self.max_connections):
+      conn = self.make_connection()
+
+      conn_queue = Queue()
+      conn_queue.put(conn)
+      self._all_connections[conn.id] = conn_queue
+
+  def get_connection(self, conn_id=None):
+    """
+    Get a connection from the pool:
+    """
+
+    chosen = randint(1, self.max_connections)
+    return  self._all_connections[chosen].get()
+
+  def get_connection_by_id(self, conn_id):
+    return self._all_connections[conn_id].get()
 
   def make_connection(self):
     "Create a new connection"
     if self._created_connections >= self.max_connections:
       raise ConnectionError("Too many connections")
-    self._created_connections += 1
+
+    # atomic integer increment
+    conn_id = self._created_counter.next()
+    self._created_connections = conn_id # increment this
 
     new_connection = self.connection_class(**self.connection_kwargs)
     new_connection.just_created = True
+    new_connection.id = conn_id
     return new_connection
 
   def release(self, connection):
     """
     Releases the connection back to the pool
     """
-    self._in_use_connections.remove(connection)
-    self._available_connections.append(connection)
+
+    self._all_connections[connection.id].put(connection)
 
   def disconnect(self):
     """
@@ -260,16 +309,17 @@ class ConnectionPool(object):
       connection.disconnect()
 
 class Job(object):
-  def __init__(self, jid, body, beanstalk):
+  def __init__(self, jid, body, beanstalk, connection):
     self.jid = jid
     self.body = body
     self.beanstalk = beanstalk
+    self.conn_id = connection.id
 
   def delete(self):
-    self.beanstalk.delete(self.jid)
+    self.beanstalk.delete(self.jid, self.conn_id)
 
   def bury(self):
-    self.beanstalk.bury(self.jid)
+    self.beanstalk.bury(self.jid, conn_id=self.conn_id)
 
   def burry(self):
     self.beanstalk.delete(self.jid)
@@ -278,6 +328,10 @@ class Job(object):
     return "jid: %s, body=%s" % (self.jid, self.body)
 
 class Beanstalk(object):
+  """
+  Base client class that handles dispatching the right commands and parsing the
+  right responses.
+  """
   def __init__(self, host="localhost", port=11300, connection_pool=None,
                parse_class=BeanstalkParser):
 
@@ -308,22 +362,27 @@ class Beanstalk(object):
 
     for tube in self.watch_tubes:
       self._send_command(connection, "watch %s\r\n" % tube, self.parser.watch)
-    self._send_command(connection, "ignore default\r\n", self.parser.ignore)
+
+    #self._send_command(connection, "ignore default\r\n", self.parser.ignore)
 
     del connection.just_created
 
-  def _make_request(self, command, parser_method):
-    connection = self.pool.get_connection()
+  def _make_request(self, command, parser_method, conn_id=None):
+    # this is in fact a lock that locks the connection
+    if conn_id == None:
+      connection = self.pool.get_connection()
+    else:
+      connection = self.pool.get_connection_by_id(conn_id)
 
     try:
       if hasattr(connection, "just_created"):
         self._set_tubes(connection)
       return self._send_command(connection, command, parser_method)
     finally:
+      # this releases the lock
       self.pool.release(connection)
 
   def reserve(self, timeout=None):
-
     if timeout is not None:
       command = 'reserve-with-timeout %d\r\n' % timeout
     else:
@@ -333,7 +392,7 @@ class Beanstalk(object):
 
   def use(self, name):
     self.use_tube = name
-    return self._make_request("use %s\r\n" % name, self.parser.use)
+    #return self._make_request("use %s\r\n" % name, self.parser.use)
 
   def put(self, body, priority=DEFAULT_PRIORITY, delay=0, ttr=DEFAULT_TTR):
     if not isinstance(body, str):
@@ -345,14 +404,20 @@ class Beanstalk(object):
 
   def watch(self, name):
     self.watch_tubes.append(name)
-    return self._make_request("watch %s\r\n" % name, self.parser.watch)
+    #return self._make_request("watch %s\r\n" % name, self.parser.watch)
 
   def ignore(self, name):
     return self._make_request("ignore %s\r\n" % name, self.parser.ignore)
 
-  def delete(self, job_id):
-    return self._make_request("delete %s\r\n" % job_id, self.parser.delete)
+  def peek(self, job_id):
+    return self._make_request("peek %s\r\n" % job_id, self.parser.peek)
 
-  def bury(self, job_id, priority=DEFAULT_PRIORITY):
-    return self._make_request("bury %s %s\r\n" % (job_id, priority), self.parser.bury)
+  def touch(self, job_id):
+    return self._make_request("touch %s\r\n" % job_id, self.parser.touch)
 
+  def delete(self, job_id, conn_id=None):
+    #peeked_job = self.peek(job_id)
+    return self._make_request("delete %s\r\n" % job_id, self.parser.delete, conn_id=conn_id)
+
+  def bury(self, job_id, priority=DEFAULT_PRIORITY, conn_id=None):
+    return self._make_request("bury %s %s\r\n" % (job_id, priority), self.parser.bury, conn_id=conn_id)
